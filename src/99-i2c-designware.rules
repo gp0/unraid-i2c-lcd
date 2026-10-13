@@ -1,0 +1,5 @@
+# Stable names for the Synopsys DesignWare I2C buses, independent of i2c-N numbering.
+SUBSYSTEM=="i2c-dev", KERNELS=="i2c_designware.0", SYMLINK+="i2c-designware-0"
+SUBSYSTEM=="i2c-dev", KERNELS=="i2c_designware.1", SYMLINK+="i2c-designware-1"
+SUBSYSTEM=="i2c-dev", KERNELS=="i2c_designware.2", SYMLINK+="i2c-designware-2"
+SUBSYSTEM=="i2c-dev", KERNELS=="i2c_designware.3", SYMLINK+="i2c-designware-3"

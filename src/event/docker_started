@@ -1,0 +1,2 @@
+#!/bin/bash
+/usr/local/emhttp/plugins/i2c-designware/scripts/ensure.sh

@@ -1,0 +1,245 @@
+<?xml version='1.0' standalone='yes'?>
+<!DOCTYPE PLUGIN>
+
+<PLUGIN
+  name="i2c-designware"
+  author="gp0"
+  version="2026.10.13"
+  pluginURL="https://raw.githubusercontent.com/gp0/unraid-i2c-lcd/main/plugin/i2c-designware.plg"
+  support="https://github.com/gp0/unraid-i2c-lcd/issues"
+  min="7.0.0"
+  icon="microchip"
+>
+
+<CHANGES>
+<![CDATA[
+### 2026.10.13
+
+- Initial release: build DesignWare I2C modules per kernel in Docker, load at boot, stable /dev/i2c-designware-N names
+]]>
+</CHANGES>
+
+<!--
+The plugin manager skips files that already exist, so clear old ones for updates.
+-->
+<FILE Run="/bin/bash">
+<INLINE>
+rm -rf /usr/local/emhttp/plugins/i2c-designware
+</INLINE>
+</FILE>
+
+<FILE Name="/usr/local/emhttp/plugins/i2c-designware/README.md" Mode="0644">
+<INLINE>
+<![CDATA[
+**I2C DesignWare**
+
+Builds and loads the Synopsys DesignWare I2C driver (`i2c-designware-platform`) for the running Unraid kernel, which Unraid does not ship. Needed for the I2C pins on boards like the ODROID-H3. Modules are rebuilt automatically in Docker after an OS update. Buses appear as `/dev/i2c-designware-N`.
+]]>
+</INLINE>
+</FILE>
+
+<FILE Name="/usr/local/emhttp/plugins/i2c-designware/99-i2c-designware.rules" Mode="0644">
+<INLINE>
+<![CDATA[
+# Stable names for the Synopsys DesignWare I2C buses, independent of i2c-N numbering.
+SUBSYSTEM=="i2c-dev", KERNELS=="i2c_designware.0", SYMLINK+="i2c-designware-0"
+SUBSYSTEM=="i2c-dev", KERNELS=="i2c_designware.1", SYMLINK+="i2c-designware-1"
+SUBSYSTEM=="i2c-dev", KERNELS=="i2c_designware.2", SYMLINK+="i2c-designware-2"
+SUBSYSTEM=="i2c-dev", KERNELS=="i2c_designware.3", SYMLINK+="i2c-designware-3"
+]]>
+</INLINE>
+</FILE>
+
+<FILE Name="/usr/local/emhttp/plugins/i2c-designware/scripts/build.sh" Mode="0755">
+<INLINE>
+<![CDATA[
+#!/bin/bash
+# Build the Synopsys DesignWare I2C modules for an Unraid kernel.
+# Compiles inside a throwaway container using kernel.org sources plus
+# Unraid's own kernel config from /usr/src/linux-<kver>/config.
+#
+# Usage: build.sh [kernel-release]   (default: running kernel)
+set -euo pipefail
+
+KVER=${1:-$(uname -r)}
+BASE=${KVER%-Unraid}
+SRC=/usr/src/linux-$KVER
+CACHE=${CACHE:-/boot/config/plugins/i2c-designware}
+OUT=$CACHE/$KVER
+
+log() { echo "$(date '+%F %T') build[$KVER]: $*"; }
+
+[ -f "$SRC/config" ] || { log "missing $SRC/config"; exit 1; }
+
+# Match the compiler major version Unraid used, e.g. CONFIG_GCC_VERSION=160200 -> gcc:16
+GCC_MAJOR=$(sed -n 's/^CONFIG_GCC_VERSION=\([0-9]*\)[0-9]\{4\}$/\1/p' "$SRC/config")
+IMAGE=${IMAGE:-gcc:${GCC_MAJOR:-latest}}
+
+PULLED=0
+docker image inspect "$IMAGE" >/dev/null 2>&1 || PULLED=1
+
+mkdir -p "$CACHE"
+TMP=$(mktemp -d "$CACHE/.build-XXXXXX")
+cleanup() {
+  rm -rf "$TMP"
+  if [ "$PULLED" = 1 ]; then docker rmi -f "$IMAGE" >/dev/null 2>&1 || true; fi
+}
+trap cleanup EXIT
+
+log "building with $IMAGE"
+docker run --rm \
+  -v "$SRC:/unraid:ro" \
+  -v "$TMP:/out" \
+  -e BASE="$BASE" -e DEBIAN_FRONTEND=noninteractive \
+  "$IMAGE" bash -euo pipefail -c '
+    apt-get update -qq
+    apt-get install -y -qq flex bison bc libelf-dev libssl-dev xz-utils curl kmod >/dev/null
+
+    major=${BASE%%.*}
+    cd /usr/src
+    curl -fsSL "https://cdn.kernel.org/pub/linux/kernel/v${major}.x/linux-${BASE}.tar.xz" | tar xJ
+    cd "linux-${BASE}"
+
+    cp /unraid/config .config
+    scripts/config --module I2C_DESIGNWARE_CORE --module I2C_DESIGNWARE_PLATFORM \
+                   --disable I2C_DESIGNWARE_PCI --disable I2C_DESIGNWARE_SLAVE
+    make -s olddefconfig
+    grep -q "^CONFIG_I2C_DESIGNWARE_PLATFORM=m" .config
+
+    make -s -j"$(nproc)" modules_prepare
+    # No Module.symvers without a full kernel build; symbols resolve at load time.
+    KBUILD_MODPOST_WARN=1 make -s -j"$(nproc)" M=drivers/i2c/busses modules 2>&1 \
+      | grep -vE "undefined!|Module.symvers|unresolved symbol|dependencies or modversions|KBUILD_MODPOST_WARN|at your own risk" || true
+
+    for m in drivers/i2c/busses/i2c-designware-core.ko drivers/i2c/busses/i2c-designware-platform.ko; do
+      strip --strip-debug "$m"
+      cp "$m" /out/
+    done
+  '
+
+for m in "$TMP"/*.ko; do
+  vm=$(modinfo -F vermagic "$m")
+  case "$vm" in
+    "$KVER "*) ;;
+    *) log "vermagic mismatch in $(basename "$m"): $vm"; exit 1 ;;
+  esac
+done
+
+rm -rf "$OUT"
+mkdir -p "$OUT"
+cp "$TMP"/*.ko "$OUT"/
+log "modules cached in $OUT"
+]]>
+</INLINE>
+</FILE>
+
+<FILE Name="/usr/local/emhttp/plugins/i2c-designware/scripts/ensure.sh" Mode="0755">
+<INLINE>
+<![CDATA[
+#!/bin/bash
+# Load the modules, building them first in the background if this kernel has none cached.
+PLUGIN=/usr/local/emhttp/plugins/i2c-designware
+LOG=/var/log/i2c-designware.log
+LOCK=/var/run/i2c-designware.lock
+
+"$PLUGIN/scripts/load.sh" >>"$LOG" 2>&1
+rc=$?
+[ $rc = 2 ] || exit $rc
+
+if ! docker info >/dev/null 2>&1; then
+  echo "$(date '+%F %T') ensure: no modules for $(uname -r) yet, will build once Docker is running" >>"$LOG"
+  exit 0
+fi
+
+# emhttp waits for event scripts, so build detached.
+nohup flock -n "$LOCK" bash -c "
+  $PLUGIN/scripts/build.sh && $PLUGIN/scripts/load.sh || \
+    /usr/local/emhttp/webGui/scripts/notify -e i2c-designware -i alert \
+      -s 'I2C DesignWare build failed' -d 'Kernel $(uname -r) - see $LOG'
+" >>"$LOG" 2>&1 </dev/null &
+echo "building modules for $(uname -r) in the background, see $LOG"
+]]>
+</INLINE>
+</FILE>
+
+<FILE Name="/usr/local/emhttp/plugins/i2c-designware/scripts/load.sh" Mode="0755">
+<INLINE>
+<![CDATA[
+#!/bin/bash
+# Load cached DesignWare I2C modules for the running kernel.
+# Exit codes: 0 = loaded (or already loaded), 2 = no modules cached for this kernel.
+set -uo pipefail
+
+KVER=$(uname -r)
+CACHE=${CACHE:-/boot/config/plugins/i2c-designware}
+DIR=$CACHE/$KVER
+RULES=/etc/udev/rules.d/99-i2c-designware.rules
+PLUGIN=/usr/local/emhttp/plugins/i2c-designware
+
+log() { echo "$(date '+%F %T') load[$KVER]: $*"; }
+
+modprobe i2c-dev
+
+if ! cmp -s "$PLUGIN/99-i2c-designware.rules" "$RULES"; then
+  cp "$PLUGIN/99-i2c-designware.rules" "$RULES"
+  udevadm control --reload
+fi
+
+if ! grep -q '^i2c_designware_platform ' /proc/modules; then
+  [ -f "$DIR/i2c-designware-core.ko" ] && [ -f "$DIR/i2c-designware-platform.ko" ] || exit 2
+  grep -q '^i2c_designware_core ' /proc/modules || insmod "$DIR/i2c-designware-core.ko" || exit 1
+  insmod "$DIR/i2c-designware-platform.ko" || exit 1
+  log "modules loaded"
+fi
+
+udevadm trigger --subsystem-match=i2c-dev
+udevadm settle
+for l in /dev/i2c-designware-*; do
+  [ -e "$l" ] && log "$l -> $(readlink "$l")"
+done
+
+# Keep cached builds for the three most recent kernels (current always kept).
+ls -1dt "$CACHE"/*/ 2>/dev/null | grep -v "/$KVER/$" | tail -n +3 | xargs -r rm -rf
+exit 0
+]]>
+</INLINE>
+</FILE>
+
+<FILE Name="/usr/local/emhttp/plugins/i2c-designware/event/docker_started" Mode="0755">
+<INLINE>
+<![CDATA[
+#!/bin/bash
+/usr/local/emhttp/plugins/i2c-designware/scripts/ensure.sh
+]]>
+</INLINE>
+</FILE>
+
+<!--
+The 'install' script.
+-->
+<FILE Run="/bin/bash">
+<INLINE>
+<![CDATA[
+mkdir -p /boot/config/plugins/i2c-designware
+/usr/local/emhttp/plugins/i2c-designware/scripts/ensure.sh
+tail -n 5 /var/log/i2c-designware.log 2>/dev/null
+]]>
+</INLINE>
+</FILE>
+
+<!--
+The 'remove' script.
+-->
+<FILE Run="/bin/bash" Method="remove">
+<INLINE>
+<![CDATA[
+rmmod i2c_designware_platform i2c_designware_core 2>/dev/null
+rm -f /etc/udev/rules.d/99-i2c-designware.rules
+udevadm control --reload
+rm -rf /usr/local/emhttp/plugins/i2c-designware
+rm -rf /boot/config/plugins/i2c-designware
+]]>
+</INLINE>
+</FILE>
+
+</PLUGIN>
